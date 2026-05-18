@@ -117,20 +117,11 @@ def test_lambda_handler_returns_200(tmp_path, monkeypatch, uniform_rasters):
 
     handler_mod._INDEX_CACHE = None
 
-    with (patch("app.metmast.MetMastClient.find_nearest_mast") as mock_find,
-          patch("app.metmast.MetMastClient.get_wind_at_time") as mock_wind,
+    with (patch("app.handler.get_wind_at_latlon_time",
+                return_value=(5.0, 270.0, datetime(2026, 2, 2, 10, 0, tzinfo=timezone.utc))),
           patch("app.storage.LocalStore.get_text", return_value=index_line),
-          patch("app.storage.LocalStore.materialize", side_effect=lambda ref, tmpdir: ref)):
-
-        mock_find.return_value = {
-            "mast_id": "M1",
-            "lat": r["sensor_lat"],
-            "lon": r["sensor_lon"],
-            "domain_id": "test",
-        }
-        mock_wind.return_value = (
-            5.0, 270.0, datetime(2026, 2, 2, 10, 0, tzinfo=timezone.utc)
-        )
+          patch("app.storage.LocalStore.materialize", side_effect=lambda ref, tmpdir: ref),
+          patch("app.handler._iot_publish")):
 
         event = {
             "timestamp_utc": "2026-02-02T10:12:31Z",
@@ -146,7 +137,7 @@ def test_lambda_handler_returns_200(tmp_path, monkeypatch, uniform_rasters):
     assert "source_band" in body
     assert set(body["source_band"]) == {"near", "mid", "far"}
     assert body["alert"]["sensor_id"] == "SENSOR_04"
-    assert body["metmast"]["mast_id"] == "M1"
+    assert body["metmast"]["wind_source"] == "open-meteo"
     assert body["windfield"]["domain_id"] == "test"
 
 
@@ -176,13 +167,11 @@ def test_lambda_handler_index_cached_across_calls(tmp_path, monkeypatch, uniform
         "pm25": 800.0,
     }
 
-    with (patch("app.metmast.MetMastClient.find_nearest_mast",
-                return_value={"mast_id": "M1", "lat": r["sensor_lat"],
-                              "lon": r["sensor_lon"], "domain_id": "test"}),
-          patch("app.metmast.MetMastClient.get_wind_at_time",
+    with (patch("app.handler.get_wind_at_latlon_time",
                 return_value=(5.0, 270.0, datetime(2026, 2, 2, 10, 0, tzinfo=timezone.utc))),
           patch("app.storage.LocalStore.get_text", get_text_mock),
-          patch("app.storage.LocalStore.materialize", side_effect=lambda ref, tmpdir: ref)):
+          patch("app.storage.LocalStore.materialize", side_effect=lambda ref, tmpdir: ref),
+          patch("app.handler._iot_publish")):
 
         handler_mod.lambda_handler(event)
         handler_mod.lambda_handler(event)
