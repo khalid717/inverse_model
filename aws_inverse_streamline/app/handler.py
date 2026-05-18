@@ -214,6 +214,7 @@ def lambda_handler(event, context=None):
         "ang_ref": record.get("ang_ref"),
         "dsm_ref": record.get("dsm_ref"),
         "match_type": record.get("match_type"),
+        "extrapolation_warning": record.get("extrapolation_warning"),
     }
 
     # Optional: write full result + trace GeoJSON to S3

@@ -260,6 +260,7 @@ def run_inverse_streamline(*,
 
         return {
             "model": "streamline_back_trajectory",
+            "sensor_elevation_m": float(z_val),
             "distance_band_m": {
                 "min": float(d_min_band),
                 "mid": float(d_mid_band),

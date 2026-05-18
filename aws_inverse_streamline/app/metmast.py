@@ -22,13 +22,34 @@ def get_wind_at_latlon_time(lat: float, lon: float, when: datetime):
         "&timezone=UTC"
     )
 
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    hourly = r.json()["hourly"]
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        raise RuntimeError(
+            f"Open-Meteo returned HTTP {r.status_code} for lat={lat}, lon={lon}: {r.text[:200]}"
+        ) from e
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(
+            f"Open-Meteo request failed for lat={lat}, lon={lon}: {e}"
+        ) from e
 
-    times = hourly["time"]
-    speeds = hourly["wind_speed_10m"]
-    dirs = hourly["wind_direction_10m"]
+    try:
+        hourly = r.json()["hourly"]
+        times = hourly["time"]
+        speeds = hourly["wind_speed_10m"]
+        dirs = hourly["wind_direction_10m"]
+    except (KeyError, ValueError) as e:
+        raise RuntimeError(
+            f"Unexpected Open-Meteo response structure for lat={lat}, lon={lon}: {e}. "
+            f"Response: {r.text[:200]}"
+        ) from e
+
+    if not times:
+        raise RuntimeError(
+            f"Open-Meteo returned empty time series for lat={lat}, lon={lon}, when={when.isoformat()}. "
+            "Requested time may be outside the forecast window."
+        )
 
     best_idx = min(
         range(len(times)),
