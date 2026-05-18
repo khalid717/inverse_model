@@ -177,3 +177,38 @@ def test_lambda_handler_index_cached_across_calls(tmp_path, monkeypatch, uniform
         handler_mod.lambda_handler(event)
 
     assert get_text_mock.call_count == 1, "Index should be loaded only once"
+
+
+def test_iot_not_published_when_disabled(tmp_path, monkeypatch, uniform_rasters):
+    r = uniform_rasters
+    index_line = json.dumps({
+        "wspd_ms": 5.0, "dir_deg": 270,
+        "vel_ref": r["vel"], "ang_ref": r["ang"], "dsm_ref": r["dsm"],
+        "domain_id": "test",
+    })
+
+    monkeypatch.setenv("STORE_MODE", "local")
+    monkeypatch.setenv("LOCAL_LIBRARY_ROOT", str(tmp_path))
+    monkeypatch.setenv("FORCE_MODEL_CRS", f"EPSG:{r['crs_epsg']}")
+    monkeypatch.setenv("D_MAX_GLOBAL_M", "400.0")
+    monkeypatch.setenv("PUBLISH_IGNITION", "0")
+
+    handler_mod._INDEX_CACHE = None
+
+    event = {
+        "timestamp_utc": "2026-02-02T10:12:31Z",
+        "sensor_id": "S1",
+        "lat": r["sensor_lat"],
+        "lon": r["sensor_lon"],
+        "pm25": 800.0,
+    }
+
+    with (patch("app.handler.get_wind_at_latlon_time",
+                return_value=(5.0, 270.0, datetime(2026, 2, 2, 10, 0, tzinfo=timezone.utc))),
+          patch("app.storage.LocalStore.get_text", return_value=index_line),
+          patch("app.storage.LocalStore.materialize", side_effect=lambda ref, tmpdir: ref),
+          patch("app.handler._iot_publish") as mock_publish):
+
+        handler_mod.lambda_handler(event)
+
+    mock_publish.assert_not_called()

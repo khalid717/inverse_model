@@ -134,3 +134,55 @@ def test_from_jsonl_dir_normalised_mod360():
     })
     idx = WindfieldIndex.from_jsonl(line)
     assert idx.records[0]["dir_deg"] == 90
+
+
+def test_from_jsonl_missing_vel_ref_raises():
+    line = json.dumps({
+        "wspd_ms": 5.0, "dir_deg": 270,
+        "ang_ref": "a.asc", "dsm_ref": "d.tif",
+    })
+    with pytest.raises(ValueError, match="vel_ref"):
+        WindfieldIndex.from_jsonl(line)
+
+
+def test_from_jsonl_missing_ang_ref_raises():
+    line = json.dumps({
+        "wspd_ms": 5.0, "dir_deg": 270,
+        "vel_ref": "v.asc", "dsm_ref": "d.tif",
+    })
+    with pytest.raises(ValueError, match="ang_ref"):
+        WindfieldIndex.from_jsonl(line)
+
+
+def test_from_jsonl_missing_dsm_ref_raises():
+    line = json.dumps({
+        "wspd_ms": 5.0, "dir_deg": 270,
+        "vel_ref": "v.asc", "ang_ref": "a.asc",
+    })
+    with pytest.raises(ValueError, match="dsm_ref"):
+        WindfieldIndex.from_jsonl(line)
+
+
+# ---------------------------------------------------------------------------
+# extrapolation_warning
+# ---------------------------------------------------------------------------
+
+def test_extrapolation_warning_above_range():
+    idx = _idx(_rec(3.0, 270), _rec(8.0, 270))
+    r = match_windfield(idx, 12.0, 270.0)
+    assert r["extrapolation_warning"] is not None
+    assert r["extrapolation_warning"]["observed_wspd_ms"] == 12.0
+    assert r["extrapolation_warning"]["index_range_ms"] == [3.0, 8.0]
+
+
+def test_extrapolation_warning_below_range():
+    idx = _idx(_rec(3.0, 270), _rec(8.0, 270))
+    r = match_windfield(idx, 1.5, 270.0)
+    assert r["extrapolation_warning"] is not None
+    assert r["extrapolation_warning"]["observed_wspd_ms"] == 1.5
+
+
+def test_no_extrapolation_warning_within_range():
+    idx = _idx(_rec(3.0, 270), _rec(8.0, 270))
+    r = match_windfield(idx, 5.0, 270.0)
+    assert r.get("extrapolation_warning") is None

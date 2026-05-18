@@ -231,6 +231,22 @@ def test_run_inverse_streamline_uniform_westerly(tmp_path):
     assert result["source_band"]["near"]["lon"] < sensor_lon
     assert result["distance_band_m"]["min"] < result["distance_band_m"]["max"]
 
+    # DSM elevation at sensor should be ~500m
+    assert result["sensor_elevation_m"] == pytest.approx(500.0, abs=1.0)
+
+    # trace_geojson must be a valid GeoJSON FeatureCollection with a LineString
+    gj = result["trace_geojson"]
+    assert gj["type"] == "FeatureCollection"
+    assert len(gj["features"]) == 1
+    geom = gj["features"][0]["geometry"]
+    assert geom["type"] == "LineString"
+    coords = geom["coordinates"]
+    assert len(coords) >= 2
+    # Each coordinate is [lon, lat] — check they are in plausible WGS84 range
+    for lon, lat in coords:
+        assert -180 <= lon <= 180
+        assert -90 <= lat <= 90
+
 
 def test_run_inverse_streamline_sensor_outside_domain(tmp_path):
     crs_epsg = 32632
