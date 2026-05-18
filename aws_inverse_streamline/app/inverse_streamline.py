@@ -163,9 +163,12 @@ def interpolate_point_linear(xs: np.ndarray, ys: np.ndarray, ds: np.ndarray, tar
 
 def _validate_rasters(vel_ds, ang_ds, dsm_ds) -> None:
     """Check that rasters are mutually compatible before any sampling."""
-    for name, ds in [("ang", ang_ds), ("dsm", dsm_ds)]:
-        if str(ds.crs) != str(vel_ds.crs):
-            raise ValueError(f"{name} CRS {ds.crs} != vel CRS {vel_ds.crs}")
+    # ASC files (WindNinja output) carry no embedded CRS — FORCE_MODEL_CRS handles projection.
+    # Only enforce CRS consistency when vel actually has a CRS.
+    if vel_ds.crs is not None:
+        for name, ds in [("ang", ang_ds), ("dsm", dsm_ds)]:
+            if str(ds.crs) != str(vel_ds.crs):
+                raise ValueError(f"{name} CRS {ds.crs} != vel CRS {vel_ds.crs}")
 
     # vel and ang are from the same WindNinja run and must align exactly.
     if vel_ds.shape != ang_ds.shape or vel_ds.transform != ang_ds.transform:
