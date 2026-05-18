@@ -9,24 +9,36 @@ import rasterio
 from pyproj import Transformer
 
 
+# ---------------------------------------------------------------------------
+# Pasquill-Gifford power-law dispersion coefficients
+# σy(d) = a_y * d^b_y  |  σz(d) = a_z * d^b_z   (d in m → σ in m)
+# ---------------------------------------------------------------------------
+_PG_SIGMA: Dict[str, Tuple[float, float, float, float]] = {
+    #       a_y    b_y    a_z    b_z
+    "A": (0.22,  0.900, 0.20,  0.950),  # very unstable
+    "B": (0.16,  0.900, 0.12,  0.920),  # unstable
+    "C": (0.11,  0.900, 0.08,  0.900),  # slightly unstable
+    "D": (0.08,  0.900, 0.06,  0.870),  # neutral (default)
+    "E": (0.06,  0.900, 0.03,  0.840),  # slightly stable
+    "F": (0.04,  0.900, 0.016, 0.810),  # stable
+}
+
+
 @dataclass(frozen=True)
 class InverseParams:
-    """
-    Parameters for the inverse model.
-    Defaults match your notebook prototype, but can be overridden via env vars.
-    """
-    # Empirical decay calibration: C(d) = C0 * exp(-k d)
-    C0_ref: float = 1000.0
-    C_ref: float = 45.0
-    d_ref_m: float = 15.0
+    """Parameters for the inverse model (Gaussian plume + streamline back-trajectory)."""
 
-    # Fire scale uncertainty around C0_ref
-    C0_min_factor: float = 0.5
-    C0_max_factor: float = 2.0
+    # Gaussian plume: emission rate reference and uncertainty range
+    Q_ref: float = 100_000.0       # µg/s — reference source emission rate
+    Q_min_factor: float = 0.1      # Q_min = Q_ref * Q_min_factor (weak/smoldering source)
+    Q_max_factor: float = 10.0     # Q_max = Q_ref * Q_max_factor (large fire)
+
+    # Pasquill-Gifford stability class ("A"–"F")
+    stability_class: str = "D"
 
     # Distance band clamps
     d_min_global_m: float = 2.0
-    d_max_global_m: float = 1000.0
+    d_max_global_m: float = 2000.0
 
     # Streamline integration
     step_length_m: float = 2.0
@@ -45,13 +57,12 @@ class InverseParams:
             return default if v is None else v
 
         return InverseParams(
-            C0_ref=f("C0_REF", 1000.0),
-            C_ref=f("C_REF", 45.0),
-            d_ref_m=f("D_REF_M", 15.0),
-            C0_min_factor=f("C0_MIN_FACTOR", 0.5),
-            C0_max_factor=f("C0_MAX_FACTOR", 2.0),
+            Q_ref=f("Q_REF", 100_000.0),
+            Q_min_factor=f("Q_MIN_FACTOR", 0.1),
+            Q_max_factor=f("Q_MAX_FACTOR", 10.0),
+            stability_class=s("STABILITY_CLASS", "D"),
             d_min_global_m=f("D_MIN_GLOBAL_M", 2.0),
-            d_max_global_m=f("D_MAX_GLOBAL_M", 1000.0),
+            d_max_global_m=f("D_MAX_GLOBAL_M", 2000.0),
             step_length_m=f("STEP_LENGTH_M", 2.0),
             min_wind_speed_ms=f("MIN_WIND_SPEED_MS", 0.1),
             force_model_crs=s("FORCE_MODEL_CRS", None),
@@ -68,37 +79,76 @@ def sample_wind(vel_ds, ang_ds, x, y) -> Tuple[float, float]:
     return float(vel_val), float(ang_val)
 
 
-def decay_k(C0_ref: float, C_ref: float, d_ref_m: float) -> float:
-    if not (0.0 < C_ref < C0_ref):
-        raise ValueError("Need 0 < C_ref < C0_ref to calibrate k.")
-    return float(np.log(C0_ref / C_ref) / d_ref_m)
+def sigma_y(d_m: float, stability: str = "D") -> float:
+    """Lateral dispersion coefficient σy (m) at downwind distance d_m (m)."""
+    a, b, _, _ = _PG_SIGMA[stability.upper()]
+    return a * (d_m ** b)
 
 
-def distance_band_from_obs(C_obs: float, k: float,
-                           C0_min: float, C0_max: float,
+def sigma_z(d_m: float, stability: str = "D") -> float:
+    """Vertical dispersion coefficient σz (m) at downwind distance d_m (m)."""
+    _, _, a, b = _PG_SIGMA[stability.upper()]
+    return a * (d_m ** b)
+
+
+def gaussian_centerline_conc(Q: float, u: float, d_m: float, stability: str = "D") -> float:
+    """Gaussian plume centerline ground-level concentration (µg/m³).
+
+    C(d) = Q / (π × σy(d) × σz(d) × u)
+
+    Assumes: ground-level source, ground-level receptor, centerline, no reflection.
+    """
+    sy = sigma_y(d_m, stability)
+    sz = sigma_z(d_m, stability)
+    return Q / (np.pi * sy * sz * u)
+
+
+def _bisect(f, lo: float, hi: float, tol: float = 0.1, max_iter: int = 60) -> float:
+    """Bisection root-finder: f(lo) > 0, f(hi) < 0 assumed on entry."""
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        if f(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+        if (hi - lo) < tol:
+            break
+    return 0.5 * (lo + hi)
+
+
+def gaussian_distance_band(pm25_obs: float, u: float,
+                           Q_min: float, Q_max: float,
+                           stability: str,
                            d_min_global: float, d_max_global: float) -> Tuple[float, float]:
-    if C_obs <= 0:
+    """Invert Gaussian plume equation to find source distance band (m).
+
+    Concentration decreases monotonically with distance → one solution per Q.
+    Q_min (weak source) → closer distance; Q_max (strong source) → farther distance.
+    """
+    if pm25_obs <= 0:
         raise ValueError("Observed concentration must be > 0.")
+    if u <= 0:
+        raise ValueError("Wind speed must be > 0.")
 
-    # If observation is extremely high (near-source), clamp it slightly below C0_max
-    C_obs_eff = float(np.clip(C_obs, 1e-6, C0_max * 0.99))
+    def _solve_d(Q: float) -> float:
+        def residual(d):
+            return gaussian_centerline_conc(Q, u, d, stability) - pm25_obs
 
-    d1 = (1.0 / k) * np.log(C0_min / C_obs_eff)
-    d2 = (1.0 / k) * np.log(C0_max / C_obs_eff)
+        c_near = gaussian_centerline_conc(Q, u, d_min_global, stability)
+        c_far  = gaussian_centerline_conc(Q, u, d_max_global, stability)
 
-    d_candidates = [d for d in (d1, d2) if d > 0]
+        if pm25_obs >= c_near:
+            return d_min_global  # observation is very high → source very close
+        if pm25_obs <= c_far:
+            return d_max_global  # observation is low → source at or beyond max range
+        return _bisect(residual, d_min_global, d_max_global)
 
-    if not d_candidates:
-        # If both are <=0, the observation is at/above plausible C0 range.
-        # Operationally: treat as "very close", but keep a non-zero band.
-        return float(d_min_global), float(min(5.0 * d_min_global, d_max_global))
+    d_for_Q_min = _solve_d(Q_min)
+    d_for_Q_max = _solve_d(Q_max)
 
-    d_min_band = max(min(d_candidates), d_min_global)
-    d_max_band = min(max(d_candidates), d_max_global)
-    if d_min_band > d_max_band:
-        d_min_band, d_max_band = d_min_global, d_max_global
-
-    return float(d_min_band), float(d_max_band)
+    d_min_band = float(max(min(d_for_Q_min, d_for_Q_max), d_min_global))
+    d_max_band = float(min(max(d_for_Q_min, d_for_Q_max), d_max_global))
+    return d_min_band, d_max_band
 
 def trace_curved_back_trajectory(sensor_x: float, sensor_y: float,
                                  vel_ds, ang_ds,
@@ -221,13 +271,15 @@ def run_inverse_streamline(*,
         vel_val, ang_val = sample_wind(vel_ds, ang_ds, sensor_x, sensor_y)
         (z_val,) = list(dsm_ds.sample([(sensor_x, sensor_y)]))[0]
 
-        # Calibrate decay & band
-        k = decay_k(params.C0_ref, params.C_ref, params.d_ref_m)
-        C0_min = params.C0_min_factor * params.C0_ref
-        C0_max = params.C0_max_factor * params.C0_ref
+        # Gaussian plume inversion: find source distance band
+        u = max(float(vel_val), params.min_wind_speed_ms)
+        Q_min = params.Q_ref * params.Q_min_factor
+        Q_max = params.Q_ref * params.Q_max_factor
 
-        d_min_band, d_max_band = distance_band_from_obs(
-            pm25_obs, k, C0_min, C0_max, params.d_min_global_m, params.d_max_global_m
+        d_min_band, d_max_band = gaussian_distance_band(
+            pm25_obs, u, Q_min, Q_max,
+            params.stability_class,
+            params.d_min_global_m, params.d_max_global_m,
         )
         d_mid_band = 0.5 * (d_min_band + d_max_band)
 

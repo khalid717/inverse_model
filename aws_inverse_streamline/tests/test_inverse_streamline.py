@@ -6,8 +6,10 @@ from rasterio.crs import CRS
 from pyproj import Transformer
 
 from app.inverse_streamline import (
-    decay_k,
-    distance_band_from_obs,
+    sigma_y,
+    sigma_z,
+    gaussian_centerline_conc,
+    gaussian_distance_band,
     interpolate_point_linear,
     inside,
     _validate_rasters,
@@ -17,55 +19,121 @@ from app.inverse_streamline import (
 
 
 # ---------------------------------------------------------------------------
-# decay_k
+# sigma_y / sigma_z
 # ---------------------------------------------------------------------------
 
-def test_decay_k_roundtrip():
-    k = decay_k(1000.0, 45.0, 15.0)
-    assert k > 0
-    assert abs(1000.0 * np.exp(-k * 15.0) - 45.0) < 1e-6
+def test_sigma_y_increases_with_distance():
+    assert sigma_y(100.0) < sigma_y(500.0)
 
 
-def test_decay_k_invalid_c_ref_above_c0():
-    with pytest.raises(ValueError):
-        decay_k(100.0, 200.0, 15.0)
+def test_sigma_z_increases_with_distance():
+    assert sigma_z(100.0) < sigma_z(500.0)
 
 
-def test_decay_k_invalid_zero_c_ref():
-    with pytest.raises(ValueError):
-        decay_k(100.0, 0.0, 15.0)
+def test_sigma_y_class_D_100m():
+    # class D: a=0.08, b=0.9  → σy = 0.08 * 100^0.9 ≈ 5.05 m
+    val = sigma_y(100.0, "D")
+    assert 4.0 < val < 7.0
+
+
+def test_sigma_z_class_D_100m():
+    # class D: a=0.06, b=0.87 → σz = 0.06 * 100^0.87 ≈ 3.45 m
+    val = sigma_z(100.0, "D")
+    assert 2.0 < val < 5.0
+
+
+def test_unstable_class_wider_than_neutral():
+    # Class A (unstable) should give larger σy than class D at same distance
+    assert sigma_y(200.0, "A") > sigma_y(200.0, "D")
+    assert sigma_z(200.0, "A") > sigma_z(200.0, "D")
+
+
+def test_sigma_unknown_class_raises():
+    with pytest.raises(KeyError):
+        sigma_y(100.0, "Z")
 
 
 # ---------------------------------------------------------------------------
-# distance_band_from_obs
+# gaussian_centerline_conc
 # ---------------------------------------------------------------------------
 
-def test_distance_band_typical():
-    k = decay_k(1000.0, 45.0, 15.0)
-    # Use C_obs=100 so both C0_min=500 and C0_max=2000 exceed it → two positive d values
-    d_min, d_max = distance_band_from_obs(100.0, k, 500.0, 2000.0, 2.0, 1000.0)
+def test_conc_decreases_with_distance():
+    assert gaussian_centerline_conc(100_000.0, 5.0, 100.0) > gaussian_centerline_conc(100_000.0, 5.0, 500.0)
+
+
+def test_conc_increases_with_emission_rate():
+    assert gaussian_centerline_conc(200_000.0, 5.0, 200.0) > gaussian_centerline_conc(100_000.0, 5.0, 200.0)
+
+
+def test_conc_decreases_with_wind_speed():
+    assert gaussian_centerline_conc(100_000.0, 3.0, 200.0) > gaussian_centerline_conc(100_000.0, 8.0, 200.0)
+
+
+# ---------------------------------------------------------------------------
+# gaussian_distance_band
+# ---------------------------------------------------------------------------
+
+def test_gaussian_distance_band_typical():
+    d_min, d_max = gaussian_distance_band(
+        pm25_obs=25.0, u=5.0,
+        Q_min=10_000.0, Q_max=1_000_000.0,
+        stability="D",
+        d_min_global=2.0, d_max_global=2000.0,
+    )
     assert 0 < d_min < d_max
     assert d_min >= 2.0
-    assert d_max <= 1000.0
+    assert d_max <= 2000.0
 
 
-def test_distance_band_above_c0_max_clamps_to_near():
-    k = decay_k(1000.0, 45.0, 15.0)
-    d_min, d_max = distance_band_from_obs(5000.0, k, 500.0, 2000.0, 2.0, 1000.0)
-    assert d_min >= 2.0
+def test_gaussian_distance_band_Q_max_gives_farther_source():
+    # A stronger emitter produces the same observed concentration farther away
+    d_min, d_max = gaussian_distance_band(
+        pm25_obs=50.0, u=5.0,
+        Q_min=50_000.0, Q_max=500_000.0,
+        stability="D",
+        d_min_global=2.0, d_max_global=2000.0,
+    )
     assert d_max > d_min
 
 
-def test_distance_band_very_low_obs_clamps_to_global_max():
-    k = decay_k(1000.0, 45.0, 15.0)
-    d_min, d_max = distance_band_from_obs(0.001, k, 500.0, 2000.0, 2.0, 1000.0)
-    assert d_max <= 1000.0
+def test_gaussian_distance_band_high_obs_clamps_to_near():
+    # Very high PM2.5 → source must be very close (d_min ≈ d_min_global)
+    d_min, d_max = gaussian_distance_band(
+        pm25_obs=500_000.0, u=5.0,
+        Q_min=10_000.0, Q_max=1_000_000.0,
+        stability="D",
+        d_min_global=2.0, d_max_global=2000.0,
+    )
+    assert d_min == pytest.approx(2.0)
 
 
-def test_distance_band_invalid_zero_obs():
-    k = decay_k(1000.0, 45.0, 15.0)
+def test_gaussian_distance_band_low_obs_clamps_to_far():
+    # Very low PM2.5 → source is at the far limit
+    d_min, d_max = gaussian_distance_band(
+        pm25_obs=0.001, u=5.0,
+        Q_min=10_000.0, Q_max=1_000_000.0,
+        stability="D",
+        d_min_global=2.0, d_max_global=2000.0,
+    )
+    assert d_max == pytest.approx(2000.0)
+
+
+def test_gaussian_distance_band_zero_obs_raises():
     with pytest.raises(ValueError):
-        distance_band_from_obs(0.0, k, 500.0, 2000.0, 2.0, 1000.0)
+        gaussian_distance_band(0.0, 5.0, 10_000.0, 1_000_000.0, "D", 2.0, 2000.0)
+
+
+def test_gaussian_distance_band_zero_wind_raises():
+    with pytest.raises(ValueError):
+        gaussian_distance_band(25.0, 0.0, 10_000.0, 1_000_000.0, "D", 2.0, 2000.0)
+
+
+def test_gaussian_distance_band_stability_affects_result():
+    # Unstable (class A) → wider σ → plume disperses faster → same concentration
+    # reached at a CLOSER distance than for stable class F (narrow σ, less dilution)
+    d_min_A, d_max_A = gaussian_distance_band(50.0, 5.0, 100_000.0, 100_000.0, "A", 2.0, 2000.0)
+    d_min_F, d_max_F = gaussian_distance_band(50.0, 5.0, 100_000.0, 100_000.0, "F", 2.0, 2000.0)
+    assert d_min_A < d_min_F
 
 
 # ---------------------------------------------------------------------------
@@ -190,32 +258,33 @@ def _write_uniform(path, value, crs_epsg, west, south, east, north, w=30, h=30):
 
 def test_run_inverse_streamline_uniform_westerly(tmp_path):
     crs_epsg = 32632
-    west, south, east, north = 500000.0, 5440000.0, 501000.0, 5441000.0
+    west, south, east, north = 500000.0, 5440000.0, 503000.0, 5443000.0
 
     _write_uniform(str(tmp_path / "vel.tif"), 5.0,   crs_epsg, west, south, east, north)
     _write_uniform(str(tmp_path / "ang.tif"), 270.0, crs_epsg, west, south, east, north)
     _write_uniform(str(tmp_path / "dsm.tif"), 500.0, crs_epsg, west, south, east, north)
 
-    # Sensor at domain centre
     back = Transformer.from_crs(crs_epsg, 4326, always_xy=True)
     sensor_lon, sensor_lat = back.transform(
         (west + east) / 2, (south + north) / 2
     )
 
     params = InverseParams(
-        C0_ref=1000.0, C_ref=45.0, d_ref_m=15.0,
-        C0_min_factor=0.5, C0_max_factor=2.0,
-        d_min_global_m=2.0, d_max_global_m=400.0,
-        step_length_m=2.0, min_wind_speed_ms=0.1,
+        Q_ref=100_000.0,
+        Q_min_factor=0.1,
+        Q_max_factor=10.0,
+        stability_class="D",
+        d_min_global_m=2.0,
+        d_max_global_m=2000.0,
+        step_length_m=5.0,
+        min_wind_speed_ms=0.1,
         force_model_crs=f"EPSG:{crs_epsg}",
     )
 
-    # Use C_obs=100 (below C0_min=500) so both C0_min and C0_max give positive
-    # distances, ensuring a genuine band (min < max).
     result = run_inverse_streamline(
         sensor_lat=sensor_lat,
         sensor_lon=sensor_lon,
-        pm25_obs=100.0,
+        pm25_obs=25.0,
         vel_path=str(tmp_path / "vel.tif"),
         ang_path=str(tmp_path / "ang.tif"),
         dsm_path=str(tmp_path / "dsm.tif"),
@@ -226,7 +295,7 @@ def test_run_inverse_streamline_uniform_westerly(tmp_path):
     assert "source_band" in result
     assert "trace_geojson" in result
 
-    # Wind FROM 270° (westerly) → back-trajectory steps west → lower longitude
+    # Wind FROM 270° (westerly) → back-trajectory goes west → lower longitude
     assert result["source_band"]["far"]["lon"] < sensor_lon
     assert result["source_band"]["near"]["lon"] < sensor_lon
     assert result["distance_band_m"]["min"] < result["distance_band_m"]["max"]
@@ -242,10 +311,48 @@ def test_run_inverse_streamline_uniform_westerly(tmp_path):
     assert geom["type"] == "LineString"
     coords = geom["coordinates"]
     assert len(coords) >= 2
-    # Each coordinate is [lon, lat] — check they are in plausible WGS84 range
     for lon, lat in coords:
         assert -180 <= lon <= 180
         assert -90 <= lat <= 90
+
+
+def test_run_inverse_streamline_gaussian_distances_realistic(tmp_path):
+    """Gaussian model should place source in a plausible 50–2000m range."""
+    crs_epsg = 32632
+    west, south, east, north = 500000.0, 5440000.0, 504000.0, 5444000.0
+
+    _write_uniform(str(tmp_path / "vel.tif"), 6.0,   crs_epsg, west, south, east, north)
+    _write_uniform(str(tmp_path / "ang.tif"), 235.0, crs_epsg, west, south, east, north)
+    _write_uniform(str(tmp_path / "dsm.tif"), 500.0, crs_epsg, west, south, east, north)
+
+    back = Transformer.from_crs(crs_epsg, 4326, always_xy=True)
+    sensor_lon, sensor_lat = back.transform((west + east) / 2, (south + north) / 2)
+
+    params = InverseParams(
+        Q_ref=100_000.0,
+        Q_min_factor=0.1,
+        Q_max_factor=10.0,
+        stability_class="D",
+        d_min_global_m=2.0,
+        d_max_global_m=2000.0,
+        step_length_m=5.0,
+        force_model_crs=f"EPSG:{crs_epsg}",
+    )
+
+    result = run_inverse_streamline(
+        sensor_lat=sensor_lat,
+        sensor_lon=sensor_lon,
+        pm25_obs=25.0,
+        vel_path=str(tmp_path / "vel.tif"),
+        ang_path=str(tmp_path / "ang.tif"),
+        dsm_path=str(tmp_path / "dsm.tif"),
+        params=params,
+    )
+
+    d_min = result["distance_band_m"]["min"]
+    d_max = result["distance_band_m"]["max"]
+    assert 50.0 < d_min < 2000.0
+    assert d_max > d_min
 
 
 def test_run_inverse_streamline_sensor_outside_domain(tmp_path):
