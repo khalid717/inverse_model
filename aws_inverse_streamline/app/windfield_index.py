@@ -33,16 +33,22 @@ class WindfieldIndex:
             if not line:
                 continue
             recs.append(__import__("json").loads(line))
-        # Normalize required fields
+        # Normalize and validate required fields
         norm = []
-        for r in recs:
+        for i, r in enumerate(recs):
+            vel_ref = r.get("vel_s3_key") or r.get("vel_ref") or r.get("vel_local_path")
+            ang_ref = r.get("ang_s3_key") or r.get("ang_ref") or r.get("ang_local_path")
+            dsm_ref = r.get("dsm_s3_key") or r.get("dsm_ref") or r.get("dsm_local_path")
+            for field, value in [("vel_ref", vel_ref), ("ang_ref", ang_ref), ("dsm_ref", dsm_ref)]:
+                if not value:
+                    raise ValueError(f"Record {i} missing required field '{field}': {r}")
             norm.append({
                 "domain_id": r.get("domain_id"),
                 "wspd_ms": float(r["wspd_ms"]),
                 "dir_deg": int(r["dir_deg"]) % 360,
-                "vel_ref": r.get("vel_s3_key") or r.get("vel_ref") or r.get("vel_local_path"),
-                "ang_ref": r.get("ang_s3_key") or r.get("ang_ref") or r.get("ang_local_path"),
-                "dsm_ref": r.get("dsm_s3_key") or r.get("dsm_ref") or r.get("dsm_local_path"),
+                "vel_ref": vel_ref,
+                "ang_ref": ang_ref,
+                "dsm_ref": dsm_ref,
             })
         return WindfieldIndex(records=norm)
 
@@ -97,4 +103,14 @@ def match_windfield(index: WindfieldIndex,
         raise RuntimeError("Windfield index empty or no candidates.")
     out = dict(best)
     out["match_type"] = "nearest_neighbor"
+
+    index_min = min(r["wspd_ms"] for r in candidates)
+    index_max = max(r["wspd_ms"] for r in candidates)
+    if wspd_obs < index_min or wspd_obs > index_max:
+        out["extrapolation_warning"] = {
+            "observed_wspd_ms": wspd_obs,
+            "index_range_ms": [index_min, index_max],
+            "note": "observed wind speed outside pre-simulated library range",
+        }
+
     return out

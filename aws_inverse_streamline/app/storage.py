@@ -51,8 +51,8 @@ class S3Store(Store):
     def materialize(self, ref: str, tmpdir: str) -> str:
         key = self._key(ref)
         tmp = pathlib.Path(tmpdir)
-        tmp.mkdir(parents=True, exist_ok=True)
-        local_path = tmp / os.path.basename(key)
+        local_path = tmp / key
+        local_path.parent.mkdir(parents=True, exist_ok=True)
         if local_path.exists() and local_path.stat().st_size > 0:
             return str(local_path)
         self.s3.download_file(self.bucket, key, str(local_path))
