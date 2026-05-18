@@ -30,12 +30,10 @@ import json
 import os
 import boto3
 import tempfile
-from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, List
 
 from dateutil import parser as dtparser
-from app.metmast import get_wind_at_latlon_time
-from .metmast import MetMastClient
+from .metmast import get_wind_at_latlon_time
 from .windfield_index import WindfieldIndex, match_windfield
 from .inverse_streamline import run_inverse_streamline, InverseParams
 from .storage import S3Store, LocalStore, Store
@@ -97,16 +95,6 @@ def _build_store() -> Store:
         return LocalStore(root=root)
     raise ValueError(f"Unsupported STORE_MODE: {mode}")
 
-
-def _build_metmast_client() -> MetMastClient:
-    """
-    Choose how to fetch metmast wind data.
-    - METMAST_MODE=local_csv  (dev)
-    - METMAST_MODE=dynamodb   (AWS)
-    - METMAST_MODE=timestream (AWS, optional)
-    """
-    mode = os.getenv("METMAST_MODE", "local_csv").lower().strip()
-    return MetMastClient(mode=mode)
 
 
 def _load_index(store: Store) -> WindfieldIndex:
@@ -173,7 +161,6 @@ def lambda_handler(event, context=None):
     alert = _parse_alert(event)
 
     store = _build_store()
-    met = _build_metmast_client()
 
     if _INDEX_CACHE is None:
         _INDEX_CACHE = _load_index(store)
@@ -203,33 +190,33 @@ def lambda_handler(event, context=None):
         params=params,
     )
 
-    # 5) Attach metadata
-   # result["alert"] = {
-       # "sensor_id": alert["sensor_id"],
-       # "timestamp_utc": alert["timestamp"].isoformat(),
-       # "lat": alert["lat"],
-       # "lon": alert["lon"],
-       # "pm25": alert["pm25"],
-   # }
-   # result["metmast"] = {
-   #     "wind_source":"open-meteo",
-   #     "wind_lat": alert["lat"],
-   #     "wind_lon": alert["lon"],
-   #     "wind_timestamp_utc": wind_ts.isoformat(),
-   #     "wspd_ms": wspd,
-   #     "wdir_from_deg": wdir_from,
-   # }
-   # result["windfield"] = {
-   #     "domain_id": record.get("domain_id"),
-   #     "wspd_ms": record.get("wspd_ms"),
-   #     "dir_deg": record.get("dir_deg"),
-   #     "vel_ref": record.get("vel_ref"),
-   #     "ang_ref": record.get("ang_ref"),
-   #     "dsm_ref": record.get("dsm_ref"),
-   #     "match_type": record.get("match_type"),
-   # }
+    # 5) Attach metadata to full result (used for S3 + Lambda response)
+    result["alert"] = {
+        "sensor_id": alert["sensor_id"],
+        "timestamp_utc": alert["timestamp"].isoformat(),
+        "lat": alert["lat"],
+        "lon": alert["lon"],
+        "pm25": alert["pm25"],
+    }
+    result["metmast"] = {
+        "wind_source": "open-meteo",
+        "wind_lat": alert["lat"],
+        "wind_lon": alert["lon"],
+        "wind_timestamp_utc": wind_ts.isoformat(),
+        "wspd_ms": wspd,
+        "wdir_from_deg": wdir_from,
+    }
+    result["windfield"] = {
+        "domain_id": record.get("domain_id"),
+        "wspd_ms": record.get("wspd_ms"),
+        "dir_deg": record.get("dir_deg"),
+        "vel_ref": record.get("vel_ref"),
+        "ang_ref": record.get("ang_ref"),
+        "dsm_ref": record.get("dsm_ref"),
+        "match_type": record.get("match_type"),
+    }
 
-    # Optional: write result + trace GeoJSON to S3
+    # Optional: write full result + trace GeoJSON to S3
     if os.getenv("WRITE_OUTPUTS", "0") == "1":
         out_prefix = os.getenv("OUTPUT_PREFIX", "outputs").strip("/")
         key_base = f"{out_prefix}/{alert['sensor_id']}/{alert['timestamp'].strftime('%Y%m%dT%H%M%SZ')}"
@@ -237,10 +224,17 @@ def lambda_handler(event, context=None):
         if result.get("trace_geojson"):
             store.put_text(f"{key_base}_trace.geojson", json.dumps(result["trace_geojson"]))
 
-    # Publish ignition result to AWS IoT Core (optional)
+    # Publish lean payload to AWS IoT Core (optional) — no metadata or trace
     if os.getenv("PUBLISH_IGNITION", "1") == "1":
         topic = os.getenv("IGNITION_TOPIC", "wildfire/v2/ignition")
-        _iot_publish(topic, result, qos=0)
+        mqtt_payload = {
+            "sensor_id": alert["sensor_id"],
+            "timestamp_utc": alert["timestamp"].isoformat(),
+            "model": result["model"],
+            "distance_band_m": result["distance_band_m"],
+            "source_band": result["source_band"],
+        }
+        _iot_publish(topic, mqtt_payload, qos=0)
 
 
     return {

@@ -273,4 +273,5 @@ def run_inverse_streamline(*,
                 "mid": {"lat": float(src_mid_lat), "lon": float(src_mid_lon)},
                 "far": {"lat": float(src_max_lat), "lon": float(src_max_lon)},
             },
+            "trace_geojson": _to_geojson_line(lons, lats),
         }        
