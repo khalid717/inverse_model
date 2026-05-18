@@ -161,6 +161,20 @@ def interpolate_point_linear(xs: np.ndarray, ys: np.ndarray, ds: np.ndarray, tar
     return float(x), float(y)
 
 
+def _validate_rasters(vel_ds, ang_ds, dsm_ds) -> None:
+    """Check that rasters are mutually compatible before any sampling."""
+    for name, ds in [("ang", ang_ds), ("dsm", dsm_ds)]:
+        if str(ds.crs) != str(vel_ds.crs):
+            raise ValueError(f"{name} CRS {ds.crs} != vel CRS {vel_ds.crs}")
+
+    # vel and ang are from the same WindNinja run and must align exactly.
+    if vel_ds.shape != ang_ds.shape or vel_ds.transform != ang_ds.transform:
+        raise ValueError(
+            f"ang grid (shape={ang_ds.shape}, transform={ang_ds.transform}) "
+            f"does not match vel grid (shape={vel_ds.shape}, transform={vel_ds.transform})"
+        )
+
+
 def _to_geojson_line(lons: List[float], lats: List[float]) -> Dict[str, Any]:
     return {
         "type": "FeatureCollection",
@@ -188,6 +202,7 @@ def run_inverse_streamline(*,
     Returns a machine-readable dict with min/mid/max source band and optional trace GeoJSON.
     """
     with rasterio.open(dsm_path) as dsm_ds, rasterio.open(vel_path) as vel_ds, rasterio.open(ang_path) as ang_ds:
+        _validate_rasters(vel_ds, ang_ds, dsm_ds)
         model_crs = params.force_model_crs or str(dsm_ds.crs)
         if model_crs is None or model_crs == "None":
             raise RuntimeError("DSM has no CRS; set FORCE_MODEL_CRS env var (e.g. EPSG:25832).")

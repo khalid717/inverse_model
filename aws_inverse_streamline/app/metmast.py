@@ -12,6 +12,17 @@ from dateutil import parser as dtparser
 import requests
 from datetime import datetime, timezone
 
+# Module-level caches — survive across warm Lambda invocations.
+_MAST_LIST_CACHE: Dict[str, Tuple[float, List[Dict]]] = {}
+# path -> (mtime, list[mast_dict])
+
+_WIND_CSV_CACHE: Dict[str, Tuple[float, Dict[str, List[Dict]]]] = {}
+# path -> (mtime, {mast_id: [row_dict, ...]})
+
+_DDB_MAST_CACHE: Dict[str, List[Dict]] = {}
+# table_name -> list[mast_dict]
+
+
 def get_wind_at_latlon_time(lat: float, lon: float, when: datetime):
     """
     Fetch wind from Open-Meteo (hourly) for a given lat/lon and time.
@@ -54,6 +65,26 @@ def _haversine_m(lat1, lon1, lat2, lon2) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
+def _load_wind_csv(path: str) -> Dict[str, List[Dict]]:
+    """Load and index wind CSV by mast_id; result cached until file changes."""
+    mtime = os.path.getmtime(path)
+    cached = _WIND_CSV_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    index: Dict[str, List[Dict]] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        header = f.readline().strip().split(",")
+        for line in f:
+            if not line.strip():
+                continue
+            row = dict(zip(header, line.strip().split(",")))
+            index.setdefault(row["mast_id"], []).append(row)
+
+    _WIND_CSV_CACHE[path] = (mtime, index)
+    return index
+
+
 @dataclass
 class MetMastClient:
     """
@@ -66,7 +97,6 @@ class MetMastClient:
     - dynamodb:
         METMAST_TABLE_DDB: DynamoDB table for mast metadata (mast_id PK)
         METMAST_WIND_DDB:  DynamoDB table for wind (mast_id PK, timestamp_utc SK)
-    - timestream: placeholder (add your query when ready)
     """
     mode: str = "local_csv"
 
@@ -79,14 +109,18 @@ class MetMastClient:
 
     def _load_masts_local(self) -> List[Dict[str, Any]]:
         path = os.getenv("METMAST_TABLE_PATH", "metmasts.csv")
+        mtime = os.path.getmtime(path)
+        cached = _MAST_LIST_CACHE.get(path)
+        if cached and cached[0] == mtime:
+            return cached[1]
+
         masts = []
         with open(path, "r", encoding="utf-8") as f:
             header = f.readline().strip().split(",")
             for line in f:
                 if not line.strip():
                     continue
-                parts = line.strip().split(",")
-                row = dict(zip(header, parts))
+                row = dict(zip(header, line.strip().split(",")))
                 masts.append({
                     "mast_id": row["mast_id"],
                     "lat": float(row["lat"]),
@@ -95,6 +129,8 @@ class MetMastClient:
                 })
         if not masts:
             raise RuntimeError("No metmasts found in METMAST_TABLE_PATH")
+
+        _MAST_LIST_CACHE[path] = (mtime, masts)
         return masts
 
     def find_nearest_mast(self, lat: float, lon: float) -> Dict[str, Any]:
@@ -104,15 +140,18 @@ class MetMastClient:
             table_name = os.getenv("METMAST_TABLE_DDB")
             if not table_name:
                 raise RuntimeError("Set METMAST_TABLE_DDB for dynamodb mode")
-            table = self.ddb.Table(table_name)
-            # Scan is OK if you have few masts; for many masts, keep a precomputed list or use geo index.
-            resp = table.scan()
-            masts = [{
-                "mast_id": it["mast_id"],
-                "lat": float(it["lat"]),
-                "lon": float(it["lon"]),
-                "domain_id": it.get("domain_id")
-            } for it in resp.get("Items", [])]
+            if table_name in _DDB_MAST_CACHE:
+                masts = _DDB_MAST_CACHE[table_name]
+            else:
+                table = self.ddb.Table(table_name)
+                resp = table.scan()
+                masts = [{
+                    "mast_id": it["mast_id"],
+                    "lat": float(it["lat"]),
+                    "lon": float(it["lon"]),
+                    "domain_id": it.get("domain_id")
+                } for it in resp.get("Items", [])]
+                _DDB_MAST_CACHE[table_name] = masts
         else:
             raise ValueError(f"Unsupported METMAST_MODE: {self.mode}")
 
@@ -125,6 +164,7 @@ class MetMastClient:
                 best = m
         if best is None:
             raise RuntimeError("Could not select nearest metmast.")
+        best = dict(best)
         best["distance_m"] = best_d
         return best
 
@@ -136,28 +176,21 @@ class MetMastClient:
 
         if self.mode == "local_csv":
             path = os.getenv("METMAST_WIND_PATH", "metmast_wind.csv")
+            wind_index = _load_wind_csv(path)
+            rows = wind_index.get(mast_id, [])
+            if not rows:
+                raise RuntimeError(f"No wind records for mast_id={mast_id} in {path}")
+
             best = None
             best_dt = None
             best_delta = float("inf")
-
-            with open(path, "r", encoding="utf-8") as f:
-                header = f.readline().strip().split(",")
-                for line in f:
-                    if not line.strip():
-                        continue
-                    parts = line.strip().split(",")
-                    row = dict(zip(header, parts))
-                    if row["mast_id"] != mast_id:
-                        continue
-                    ts = dtparser.isoparse(row["timestamp_utc"]).astimezone(timezone.utc)
-                    delta = abs((ts - when).total_seconds())
-                    if delta < best_delta:
-                        best_delta = delta
-                        best = row
-                        best_dt = ts
-
-            if best is None:
-                raise RuntimeError(f"No wind records for mast_id={mast_id} in {path}")
+            for row in rows:
+                ts = dtparser.isoparse(row["timestamp_utc"]).astimezone(timezone.utc)
+                delta = abs((ts - when).total_seconds())
+                if delta < best_delta:
+                    best_delta = delta
+                    best = row
+                    best_dt = ts
 
             return float(best["wspd_ms"]), float(best["wdir_from_deg"]), best_dt
 
