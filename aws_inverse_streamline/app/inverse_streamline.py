@@ -29,9 +29,11 @@ class InverseParams:
     """Parameters for the inverse model (Gaussian plume + streamline back-trajectory)."""
 
     # Gaussian plume: emission rate reference and uncertainty range
-    Q_ref: float = 100_000.0       # µg/s — reference source emission rate
-    Q_min_factor: float = 0.1      # Q_min = Q_ref * Q_min_factor (weak/smoldering source)
-    Q_max_factor: float = 10.0     # Q_max = Q_ref * Q_max_factor (large fire)
+    # Q_ref calibrated from field measurement: 7695 µg/m³ at source corresponds
+    # to ~7695 µg/s emission (small wood fire, ~100 g/min fuel consumption).
+    Q_ref: float = 7_695.0         # µg/s — reference source emission rate
+    Q_min_factor: float = 0.1      # Q_min = Q_ref * Q_min_factor (smoldering / weak)
+    Q_max_factor: float = 10.0     # Q_max = Q_ref * Q_max_factor (large active fire)
 
     # Pasquill-Gifford stability class ("A"–"F")
     stability_class: str = "D"
@@ -57,7 +59,7 @@ class InverseParams:
             return default if v is None else v
 
         return InverseParams(
-            Q_ref=f("Q_REF", 100_000.0),
+            Q_ref=f("Q_REF", 7_695.0),
             Q_min_factor=f("Q_MIN_FACTOR", 0.1),
             Q_max_factor=f("Q_MAX_FACTOR", 10.0),
             stability_class=s("STABILITY_CLASS", "D"),
